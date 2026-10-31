@@ -139,13 +139,54 @@ def retire_expired_oneshot(d: Any) -> bool:
             _current_cron_store().cron_dir, d.next_run_dt.timestamp(), ONESHOT_GRACE_SECONDS):
         return False
     claim = d.job.get("run_claim")
+    fire_claim = d.job.get("fire_claim")
     # An outage-covered claim that never reached its fire claim never started: it stays covered.
-    if isinstance(claim, dict) and claim.get("outage") and not d.job.get("fire_claim"):
+    if isinstance(claim, dict) and claim.get("outage") and not fire_claim:
         return False
-    if not (claim or d.job.get("fire_claim")):
-        write_missed(d.job, d.next_run)
+    from cron.constants import FIRE_CLAIM_TTL_SECONDS
+    from cron.jobs import (
+        _elapsed_seconds as _age, _job_running_in_this_process, _oneshot_run_claim_ttl_seconds,
+        _parse_aware)
+
+    def _claim_is_fresh(claim: Any, ttl: float) -> bool:
+        """Age-only liveness for a claim (empty/malformed/future-dated ⇒ stale).
+
+        Deliberately not ``cron.jobs._claim_is_live``: that also treats a same-host dead pid as
+        stale, but a restart-safe cron worker keeps running (and heartbeating) the claim its dead
+        parent stamped — ``_refresh_claim`` only rewrites ``at``, never ``by`` — so the pid check
+        would retire the record out from under a live run. Every live run refreshes ``at`` once a
+        minute (``heartbeat_run_claim``, #62002), so an aged-out ``at`` is the only safe proof.
+        """
+        if not isinstance(claim, dict) or not claim.get("at"):
+            return False
+        stamped = _parse_aware(claim["at"])
+        return stamped is not None and 0 <= _age(d.scan.now, stamped) < ttl
+
+    # Presence is not liveness: a claim whose owner died before mark_job_run used to pin the
+    # one-shot forever — never fired, never retired, never booked as missed (#147102). A fresh
+    # claim (or a run this scheduler still holds) keeps the record exactly as before, so its
+    # mark_job_run can still land.
+    claim_live = (
+        _claim_is_fresh(claim, _oneshot_run_claim_ttl_seconds())
+        or _claim_is_fresh(fire_claim, FIRE_CLAIM_TTL_SECONDS)
+        or _job_running_in_this_process(d.job.get("id", ""))
+    )
+    if claim_live:
+        return True
+    if claim or fire_claim:
+        # Dispatch was claimed but the run never reached mark_job_run → a wedged one-shot, not a
+        # never-ran one. Mirror the dispatch-limit guard (#73973): remove it with the wedged
+        # diagnostic, and book no "missed ×1" row — an occurrence did start.
+        from cron.jobs_oneshot_diagnostics import write_wedged
+        write_wedged(d.job)
         d.scan.retire(d.job["id"])
-        d.scan.on_saved.append(lambda job=d.job: record_cron_missed(job))
-        d.scan.on_saved.append(lambda job=d.job, first=d.next_run: _book_missed(
-            job, 1, first, "one-shot past its grace window; catch-up off", capped=False))
+        logger.info(
+            "Job '%s': one-shot claim aged out (its run never completed) — removing the wedged "
+            "entry; recreate it or use the Run button to schedule it again.", d.label)
+        return True
+    write_missed(d.job, d.next_run)
+    d.scan.retire(d.job["id"])
+    d.scan.on_saved.append(lambda job=d.job: record_cron_missed(job))
+    d.scan.on_saved.append(lambda job=d.job, first=d.next_run: _book_missed(
+        job, 1, first, "one-shot past its grace window; catch-up off", capped=False))
     return True

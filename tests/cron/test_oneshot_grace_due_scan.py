@@ -11,8 +11,10 @@ wall-clock one-shot late, contradicting the "will never fire" contract.
 These tests pin the due-scan grace gate:
   - beyond grace  -> not due; record retired with a diagnostic
   - within grace  -> still due (legitimate catch-up)
-  - beyond grace + claim -> not due, but the record is kept (a run may be
-    in flight in another process; its mark_job_run must still land)
+  - beyond grace + live claim -> not due, record kept (a run may be in flight in another
+    process; its mark_job_run must still land)
+  - beyond grace + aged-out claim -> not due, record retired as a wedged one-shot (#147102:
+    presence is not liveness — a killed run used to pin the record forever)
   - re-triggered  -> due again (the Run button still works)
 """
 
@@ -80,22 +82,68 @@ class TestOneShotGraceDueScan:
         # Still stored (dispatch proceeds normally).
         assert [j["id"] for j in load_jobs()] == ["recent"]
 
-    def test_stale_with_claim_skipped_but_record_kept(self, cron_store):
-        # A (possibly stale) run_claim means a run may still be in flight in
-        # another process — the due-scan must not fire OR retire the record,
-        # so mark_job_run can still land.
+    def test_fresh_claim_is_neither_fired_nor_retired(self, cron_store):
+        # A run may still be in flight in another process. While the claim is fresh — a live run
+        # refreshes it once a minute (heartbeat_run_claim, #62002) — the due-scan must not fire OR
+        # retire the record, so mark_job_run can still land.
         claimed = _oneshot(
             "claimed",
             FIXED_NOW - timedelta(hours=3),
             completed=1,
-            run_claim={"at": (FIXED_NOW - timedelta(hours=3)).isoformat(), "by": "other"},
+            run_claim={"at": (FIXED_NOW - timedelta(seconds=30)).isoformat(), "by": "other"},
         )
         save_jobs([claimed])
 
         due = get_due_jobs()
         assert [d["id"] for d in due] == []
-        # Record preserved (not retired) despite being beyond grace.
+        # Record preserved (not retired) while its claim is live.
         assert [j["id"] for j in load_jobs()] == ["claimed"]
+
+    def test_aged_out_claim_retires_the_wedged_record_with_a_diagnostic(self, cron_store):
+        # #147102: presence was read as liveness. This owner died between stamping the claim and
+        # mark_job_run, so the claim aged out; the record must be removed like any other wedged
+        # one-shot (#73973) instead of pinning the job forever — never fired, never retired, never
+        # diagnosed.
+        dead = _oneshot(
+            "dead",
+            FIXED_NOW - timedelta(hours=3),
+            completed=1,
+            run_claim={"at": (FIXED_NOW - timedelta(hours=3)).isoformat(), "by": "other"},
+        )
+        save_jobs([dead])
+
+        due = get_due_jobs()
+
+        assert [d["id"] for d in due] == []
+        assert [j["id"] for j in load_jobs()] == []
+        out_dir = cron_store / "cron" / "output" / "dead"
+        diag = list(out_dir.glob("*.md")) if out_dir.exists() else []
+        assert diag, "expected the wedged-one-shot diagnostic for the retired record"
+
+    def test_aged_out_fire_claim_retires_the_record(self, cron_store):
+        # The dispatch-time fire_claim has its own (shorter) TTL and must not pin a record either.
+        dead = _oneshot(
+            "deadfire",
+            FIXED_NOW - timedelta(hours=3),
+            completed=1,
+            fire_claim={"at": (FIXED_NOW - timedelta(minutes=30)).isoformat(), "by": "other"},
+        )
+        save_jobs([dead])
+
+        assert get_due_jobs() == []
+        assert [j["id"] for j in load_jobs()] == []
+
+    def test_outage_claim_without_a_fire_claim_still_fires_once(self, cron_store):
+        # The recovery marker means the run never started: it keeps firing late, unchanged.
+        skipped = _oneshot(
+            "outaged",
+            FIXED_NOW - timedelta(hours=3),
+            completed=0,
+            run_claim={"outage": True},
+        )
+        save_jobs([skipped])
+
+        assert [d["id"] for d in get_due_jobs()] == ["outaged"]
 
     def test_retriggered_stale_oneshot_is_due(self, cron_store):
         # A user can still explicitly re-run a stale one-shot: trigger_job
